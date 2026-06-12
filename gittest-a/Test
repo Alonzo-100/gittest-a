@@ -1,0 +1,246 @@
+import sys
+import os
+import numpy as np
+import librosa
+from scipy.fft import fft, fftfreq
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+# ===================== 配置参数 =====================
+# DTMF标准频率表（低频组 + 高频组）
+DTMF_TABLE = {
+    (697, 1209): '1', (697, 1336): '2', (697, 1477): '3',
+    (770, 1209): '4', (770, 1336): '5', (770, 1477): '6',
+    (852, 1209): '7', (852, 1336): '8', (852, 1477): '9',
+    (941, 1336): '0', (941, 1477): '*', (941, 1633): '#'
+}
+# 频率容错范围（适配手机录音的轻微偏移）
+FREQ_TOL = 20
+# 静音分割参数（根据实际录音调整）
+SILENCE_THRESHOLD = 0.02  # 静音能量阈值
+MIN_DURATION = 0.2        # 单段拨号音最小时长（秒）
+SAMPLE_RATE = 8000        # 统一采样率，降低计算量
+# ====================================================
+
+
+class DTMFApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("DTMF 拨号音识别工具")
+        self.root.geometry("800x700")
+
+        # 变量
+        self.file_path = ""
+        self.audio_data = None
+        self.sr = SAMPLE_RATE
+        self.result = ""
+
+        # 界面组件
+        self.create_widgets()
+
+    def create_widgets(self):
+        # 标题
+        title_label = tk.Label(self.root, text="DTMF 拨号音识别", font=("微软雅黑", 20, "bold"))
+        title_label.pack(pady=15)
+
+        # 文件选择区域
+        frame_file = tk.Frame(self.root)
+        frame_file.pack(pady=10, fill=tk.X, padx=20)
+
+        self.file_entry = tk.Entry(frame_file, width=60, font=("微软雅黑", 10))
+        self.file_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
+        btn_select = tk.Button(frame_file, text="选择音频文件", command=self.select_file, font=("微软雅黑", 10))
+        btn_select.pack(side=tk.LEFT, padx=5)
+
+        # 识别按钮
+        btn_recognize = tk.Button(self.root, text="开始识别", command=self.recognize, font=("微软雅黑", 12), bg="#4CAF50", fg="white", width=15)
+        btn_recognize.pack(pady=15)
+
+        # 结果显示
+        frame_result = tk.Frame(self.root)
+        frame_result.pack(pady=10, fill=tk.X, padx=20)
+
+        tk.Label(frame_result, text="识别结果：", font=("微软雅黑", 12)).pack(side=tk.LEFT, padx=5)
+        self.result_label = tk.Label(frame_result, text="", font=("微软雅黑", 14, "bold"), fg="#2196F3")
+        self.result_label.pack(side=tk.LEFT, padx=5)
+
+        # 绘图区域（波形+频谱）
+        self.frame_plot = tk.Frame(self.root)
+        self.frame_plot.pack(pady=10, fill=tk.BOTH, expand=True, padx=20)
+
+    def select_file(self):
+        """选择音频文件"""
+        file_path = filedialog.askopenfilename(
+            title="选择音频文件",
+            filetypes=[("音频文件", "*.wav;*.mp3;*.m4a"), ("所有文件", "*.*")]
+        )
+        if file_path:
+            self.file_path = file_path
+            self.file_entry.delete(0, tk.END)
+            self.file_entry.insert(0, file_path)
+
+    def read_audio(self, file_path):
+        """读取音频（兼容非标准WAV/MP3等，解决格式报错）"""
+        try:
+            # librosa自动解码，兼容更多格式
+            data, sr = librosa.load(file_path, sr=SAMPLE_RATE, mono=True)
+            return data, sr
+        except Exception as e:
+            raise Exception(f"音频读取失败：{str(e)}")
+
+    def split_digits(self, signal, sr):
+        """通过静音检测分割单个数字的音频片段"""
+        # 计算短时能量
+        frame_length = int(0.02 * sr)  # 20ms一帧
+        hop_length = int(0.01 * sr)    # 10ms步长
+        energy = np.array([
+            np.sum(np.abs(signal[i:i+frame_length])**2)
+            for i in range(0, len(signal), hop_length)
+        ])
+        # 归一化能量
+        if np.max(energy) > 0:
+            energy = energy / np.max(energy)
+
+        # 标记有效片段
+        is_speech = energy > SILENCE_THRESHOLD
+        segments = []
+        start = None
+
+        for i, speech in enumerate(is_speech):
+            if speech and start is None:
+                start = i * hop_length
+            elif not speech and start is not None:
+                end = i * hop_length
+                duration = (end - start) / sr
+                if duration >= MIN_DURATION:
+                    segments.append((start, end))
+                start = None
+
+        # 处理最后一段
+        if start is not None:
+            end = len(signal)
+            duration = (end - start) / sr
+            if duration >= MIN_DURATION:
+                segments.append((start, end))
+
+        # 提取片段
+        digit_signals = [signal[s:e] for s, e in segments]
+        return digit_signals
+
+    def get_main_freqs(self, signal, sr):
+        """FFT提取幅值最大的两个频率"""
+        N = len(signal)
+        if N == 0:
+            return None
+
+        # 加汉明窗减少频谱泄露
+        window = np.hamming(N)
+        signal_win = signal * window
+
+        yf = fft(signal_win)
+        xf = fftfreq(N, 1 / sr)
+
+        # 取正频率部分
+        mask = xf > 0
+        freqs = xf[mask]
+        amps = np.abs(yf[mask])
+
+        # 取幅值前二的频率（按升序排列）
+        top2_idx = np.argsort(amps)[-2:]
+        return sorted(freqs[top2_idx])
+
+    def freq_to_digit(self, freqs):
+        """将检测到的频率映射为数字"""
+        if freqs is None or len(freqs) < 2:
+            return ""
+        f1, f2 = freqs
+        for (lf, hf), digit in DTMF_TABLE.items():
+            if abs(f1 - lf) < FREQ_TOL and abs(f2 - hf) < FREQ_TOL:
+                return digit
+        return ""
+
+    def plot_signal(self, full_signal, digit_signals, sr):
+        """绘制时域波形和频域频谱"""
+        # 清空旧图
+        for widget in self.frame_plot.winfo_children():
+            widget.destroy()
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 5), dpi=100)
+
+        # 1. 绘制完整音频时域波形
+        t_full = np.linspace(0, len(full_signal)/sr, len(full_signal))
+        ax1.plot(t_full, full_signal, color="#2196F3")
+        ax1.set_title("音频时域波形", fontsize=12)
+        ax1.set_xlabel("时间 (秒)")
+        ax1.set_ylabel("幅值")
+        ax1.grid(alpha=0.3)
+
+        # 2. 绘制第一个数字片段的频谱（若有）
+        if digit_signals:
+            first_digit = digit_signals[0]
+            N = len(first_digit)
+            xf = fftfreq(N, 1/sr)
+            yf = np.abs(fft(first_digit))
+            mask = xf > 0
+            ax2.plot(xf[mask], yf[mask], color="#FF5722")
+            ax2.set_title("单段拨号音频频频谱", fontsize=12)
+            ax2.set_xlabel("频率 (Hz)")
+            ax2.set_ylabel("幅值")
+            ax2.set_xlim(0, 2000)  # DTMF频率最高1633Hz，限制范围更清晰
+            ax2.grid(alpha=0.3)
+
+        plt.tight_layout()
+
+        # 嵌入到Tkinter窗口
+        canvas = FigureCanvasTkAgg(fig, master=self.frame_plot)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def recognize(self):
+        """完整识别流程"""
+        if not self.file_path:
+            messagebox.showwarning("警告", "请先选择音频文件！")
+            return
+
+        try:
+            # 1. 读取音频
+            self.audio_data, self.sr = self.read_audio(self.file_path)
+
+            # 2. 分割数字片段
+            digit_signals = self.split_digits(self.audio_data, self.sr)
+            if not digit_signals:
+                messagebox.showinfo("提示", "未检测到有效拨号音，请检查音频文件！")
+                return
+
+            # 3. 逐个识别数字
+            self.result = ""
+            for sig in digit_signals:
+                freqs = self.get_main_freqs(sig, self.sr)
+                digit = self.freq_to_digit(freqs)
+                if digit:
+                    self.result += digit
+
+            # 4. 更新结果
+            self.result_label.config(text=self.result)
+
+            # 5. 绘制波形和频谱
+            self.plot_signal(self.audio_data, digit_signals, self.sr)
+
+            messagebox.showinfo("完成", f"识别成功！号码：{self.result}")
+
+        except Exception as e:
+            messagebox.showerror("错误", f"识别失败：{str(e)}")
+            print(f"错误详情：{str(e)}")
+
+
+if __name__ == "__main__":
+    # 解决matplotlib中文乱码
+    plt.rcParams["font.sans-serif"] = ["SimHei", "WenQuanYi Micro Hei", "Heiti TC"]
+    plt.rcParams["axes.unicode_minus"] = False
+
+    root = tk.Tk()
+    app = DTMFApp(root)
+    root.mainloop()
